@@ -90,11 +90,13 @@ dsLHsBinds binds = do { binds' <- ds_lhs_binds binds
                       ; return (fromOL binds') }
 
 ------------------------
+--Map dsLHsBind across the bag of LHsBinds.  
+--Fold together into an OrdList using appOL and nilOL as the base case
 ds_lhs_binds :: LHsBinds Id -> DsM (OrdList (Id,CoreExpr))
-
 ds_lhs_binds binds = do { ds_bs <- mapBagM dsLHsBind binds
                         ; return (foldBag appOL id nilOL ds_bs) }
 
+--Desugar LHsBind.  Project bind from Loc and the hand it to dsHsBind
 dsLHsBind :: (Origin, LHsBind Id) -> DsM (OrdList (Id,CoreExpr))
 dsLHsBind (origin, L loc bind)
   = handleWarnings $ putSrcSpanDs loc $ dsHsBind bind
@@ -103,8 +105,12 @@ dsLHsBind (origin, L loc bind)
                      then discardWarningsDs
                      else id
 
+--The big function 
+--Take an HsBind Id and produce an ordered list of Vars corresponding to their bodies
+--Or CoreExprs
 dsHsBind :: HsBind Id -> DsM (OrdList (Id,CoreExpr))
 
+--Variable bindings
 dsHsBind (VarBind { var_id = var, var_rhs = expr, var_inline = inline_regardless })
   = do  { dflags <- getDynFlags
         ; core_expr <- dsLExpr expr
@@ -116,6 +122,7 @@ dsHsBind (VarBind { var_id = var, var_rhs = expr, var_inline = inline_regardless
 
         ; return (unitOL (makeCorePair dflags var' False 0 core_expr)) }
 
+--Function Bindings
 dsHsBind (FunBind { fun_id = L _ fun, fun_matches = matches
                   , fun_co_fn = co_fn, fun_tick = tick
                   , fun_infix = inf })
@@ -126,6 +133,7 @@ dsHsBind (FunBind { fun_id = L _ fun, fun_matches = matches
         ; {- pprTrace "dsHsBind" (ppr fun <+> ppr (idInlinePragma fun)) $ -}
            return (unitOL (makeCorePair dflags fun False 0 rhs)) }
 
+--Pattern bindings
 dsHsBind (PatBind { pat_lhs = pat, pat_rhs = grhss, pat_rhs_ty = ty
                   , pat_ticks = (rhs_tick, var_ticks) })
   = do	{ body_expr <- dsGuarded grhss ty
@@ -139,15 +147,36 @@ dsHsBind (PatBind { pat_lhs = pat, pat_rhs = grhss, pat_rhs_ty = ty
 	-- Non-recursive bindings come through this way
 	-- So do self-recursive bindings, and recursive bindings
 	-- that have been chopped up with type signatures
+--"AbsBindings"  These bindings appear to be at the top layer of
+--whatever is produced by GHC.  There are two different ways to distill these out
+--One expects a singleton list [export].  The other is more general.
+
+--This is the special case for singleton list [export]
 dsHsBind (AbsBinds { abs_tvs = tyvars, abs_ev_vars = dicts
                    , abs_exports = [export]
                    , abs_ev_binds = ev_binds, abs_binds = binds })
+
+  --Here we are exploding out the one export to work on in this binding
+  --using guards.  Gnarly.
   | ABE { abe_wrap = wrap, abe_poly = global
         , abe_mono = local, abe_prags = prags } <- export
-  = do  { dflags <- getDynFlags
+
+  --Here we begin the process of desugaring a single ABS binding
+  = do  { dflags <- getDynFlags --Get the flags 
+
+        -- bind_prs (bind pairs?)
+        --run the above function ds_lhs_binds which takes locally scoped binds :: LHSBinds idL 
+        --and runs the binds procedure on each of them on all contained binds in the
+        --binds abstraction (AbsBinds) structure
         ; bind_prs    <- ds_lhs_binds binds
+        --Core bind is defined as a Rec (Recursive) indicator over a list of 
+        --bind pairs from the OrdList we'd built up to this point
 	; let	core_bind = Rec (fromOL bind_prs)
+        --Desugar the TypeChecked Evidence Bindings given by ev_binds
+        --FIXME: For now we're gonna ignore this step
         ; ds_binds <- dsTcEvBinds ev_binds
+        --Produce the right hand side of the bind by running dsWrapper on Wrap
+        --from AbsBinds
         ; rhs <- dsHsWrapper wrap $  -- Usually the identity
 			    mkLams tyvars $ mkLams dicts $ 
 	                    mkCoreLets ds_binds $
@@ -162,6 +191,7 @@ dsHsBind (AbsBinds { abs_tvs = tyvars, abs_ev_vars = dicts
     
 	; return (main_bind `consOL` spec_binds) }
 
+--This is the general case AbsBinds
 dsHsBind (AbsBinds { abs_tvs = tyvars, abs_ev_vars = dicts
                    , abs_exports = exports, abs_ev_binds = ev_binds
                    , abs_binds = binds })
@@ -705,6 +735,7 @@ as the old one, but with an Internal name and no IdInfo.
 
 
 \begin{code}
+--Desugaring HsWrappers
 dsHsWrapper :: HsWrapper -> CoreExpr -> DsM CoreExpr
 dsHsWrapper WpHole 	      e = return e
 dsHsWrapper (WpTyApp ty)      e = return $ App e (Type ty)
@@ -718,10 +749,15 @@ dsHsWrapper (WpTyLam tv)      e = return $ Lam tv e
 dsHsWrapper (WpEvApp evtrm)   e = liftM (App e) (dsEvTerm evtrm)
 
 --------------------------------------
+
+--Function for desugaring the Typechecked Evidence Binds
+--This function projects EvBinds out of TcEvBinds
 dsTcEvBinds :: TcEvBinds -> DsM [CoreBind]
 dsTcEvBinds (TcEvBinds {}) = panic "dsEvBinds"    -- Zonker has got rid of this
 dsTcEvBinds (EvBinds bs)   = dsEvBinds bs
 
+--Desugaring Evidence Binds,  MapM over a bag
+--mapM ds_cc over (sccEvBinds bs)
 dsEvBinds :: Bag EvBind -> DsM [CoreBind]
 dsEvBinds bs = mapM ds_scc (sccEvBinds bs)
   where
@@ -730,6 +766,7 @@ dsEvBinds bs = mapM ds_scc (sccEvBinds bs)
 
     ds_pair (EvBind v r) = liftM ((,) v) (dsEvTerm r)
 
+--Given some Bag of EvBinds, produce a list of SCC EvBind
 sccEvBinds :: Bag EvBind -> [SCC EvBind]
 sccEvBinds bs = stronglyConnCompFromEdgedVertices edges
   where
